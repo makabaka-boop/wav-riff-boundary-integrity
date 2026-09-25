@@ -38,8 +38,13 @@ export function parseWavHeader(bytes: ArrayBuffer): WavHeaderInfo {
 
   // RIFF 声明尺寸超出实际字节 => 被截断
   const riffSize = view.getUint32(4, true);
-  if (riffSize + 8 > bytes.byteLength) {
-    throw new WavError('CORRUPT', `RIFF 声明 ${riffSize + 8} 字节，实际只有 ${bytes.byteLength} 字节，文件已损坏或被截断`);
+  const riffEnd = riffSize + 8; // RIFF 区域末端（不含）：8 字节头 + 声明尺寸
+  if (riffEnd > bytes.byteLength) {
+    throw new WavError('CORRUPT', `RIFF 声明 ${riffEnd} 字节，实际只有 ${bytes.byteLength} 字节，文件已损坏或被截断`);
+  }
+  // 声明尺寸至少要容纳 “WAVE” 四字节标识
+  if (riffSize < 4) {
+    throw new WavError('CORRUPT', `RIFF 声明尺寸 ${riffSize} 不足以容纳 WAVE 标识，文件已损坏`);
   }
 
   let fmt: {
@@ -52,15 +57,19 @@ export function parseWavHeader(bytes: ArrayBuffer): WavHeaderInfo {
   } | null = null;
   let dataBytes = -1;
 
+  // 区块只允许出现在 RIFF 声明区域 [12, riffEnd) 内：
+  // 文件尾附带的“可解析区块”在区域之外，不能当成有效内容，
+  // 否则不同浏览器可能各自报错或照常解码，判定会随环境漂移。
   let offset = 12;
-  while (offset + 8 <= bytes.byteLength) {
+  while (offset + 8 <= riffEnd) {
     const chunkId = readAscii(view, offset, 4);
     const chunkSize = view.getUint32(offset + 4, true);
     const bodyStart = offset + 8;
-    if (bodyStart + chunkSize > bytes.byteLength) {
+    // 区块体必须同时落在声明的 RIFF 区域与物理文件内
+    if (bodyStart + chunkSize > riffEnd) {
       throw new WavError(
         'CORRUPT',
-        `区块 "${chunkId}" 声明 ${chunkSize} 字节但超出文件末尾，文件已损坏或被截断`
+        `区块 "${chunkId}" 声明 ${chunkSize} 字节但越过 RIFF 区域末端，文件已损坏或被截断`
       );
     }
 
@@ -81,6 +90,29 @@ export function parseWavHeader(bytes: ArrayBuffer): WavHeaderInfo {
     }
 
     offset = bodyStart + chunkSize + (chunkSize & 1); // 奇数字节块按字对齐填充
+    if (offset > riffEnd) {
+      // 奇数尺寸区块声明了填充字节，但下一字节已越过 RIFF 区域末端
+      throw new WavError(
+        'CORRUPT',
+        `区块 "${chunkId}" 的对齐填充超出 RIFF 区域末端，文件已损坏`
+      );
+    }
+  }
+
+  // 区块链必须恰好覆盖整个 RIFF 区域，且物理文件在区域末端后不得再有内容。
+  // 区域外字节可能被部分浏览器解析为 fmt/data 块（结果随环境变化），
+  // 一律在结构检查阶段稳定判定为损坏。
+  if (offset !== riffEnd) {
+    throw new WavError(
+      'CORRUPT',
+      `区块链在 RIFF 区域内残留 ${riffEnd - offset} 个无法解析的字节，文件已损坏`
+    );
+  }
+  if (riffEnd < bytes.byteLength) {
+    throw new WavError(
+      'CORRUPT',
+      `RIFF 区域已在第 ${riffEnd} 字节结束，文件尾仍附带 ${bytes.byteLength - riffEnd} 字节区域外数据，文件已损坏`
+    );
   }
 
   if (fmt === null) {
@@ -128,7 +160,16 @@ export function parseWavHeader(bytes: ArrayBuffer): WavHeaderInfo {
     throw new WavError('NO_TRACK', 'WAV 文件不含 data 区块，没有可读取的音轨');
   }
 
-  const frameCount = Math.floor(dataBytes / fmt.blockAlign);
+  // data 长度必须是完整采样帧的整数倍；尾部不足一帧属于结构损坏，
+  // 不能向下取整成较短帧数继续扫描（否则会产出截短后的比较结果）。
+  if (dataBytes % fmt.blockAlign !== 0) {
+    throw new WavError(
+      'CORRUPT',
+      `data 区块 ${dataBytes} 字节不能被帧大小 ${fmt.blockAlign} 整除，尾部存在残缺采样帧，文件已损坏`
+    );
+  }
+
+  const frameCount = dataBytes / fmt.blockAlign;
   if (frameCount === 0) {
     throw new WavError('NO_TRACK', 'data 区块中没有任何完整音频帧，文件不含可读取的音轨');
   }
