@@ -47,6 +47,7 @@ type DecodeBehavior =
 
 let behavior: DecodeBehavior;
 let unsupportedRate: number | null;
+let decodeCallCount: number;
 
 function installWebAudioStubs(): void {
   (globalThis as unknown as { OfflineAudioContext: unknown }).OfflineAudioContext = class {
@@ -57,6 +58,7 @@ function installWebAudioStubs(): void {
     }
 
     async decodeAudioData(): Promise<FakeAudioBuffer> {
+      decodeCallCount++;
       if (behavior.kind === 'error') throw new Error(behavior.message);
       if (behavior.kind === 'noChannels')
         return {
@@ -78,6 +80,7 @@ function installWebAudioStubs(): void {
 beforeEach(() => {
   vi.resetModules();
   unsupportedRate = null;
+  decodeCallCount = 0;
   installWebAudioStubs();
 });
 
@@ -156,6 +159,24 @@ describe('loadAndScanWav 本地解码全链路', () => {
     await expect(
       loadAndScanWav(new FakeFile('note.txt', bytes) as unknown as File)
     ).rejects.toMatchObject({ code: 'NOT_WAV' });
+  });
+
+  it('data 尾部残缺（不足一帧）→ CORRUPT，结构检查先于解码，不调用解码器', async () => {
+    const bytes = buildWavBytes({ dataTailBytes: 1 });
+    const { loadAndScanWav } = await import('../../src/audio/decoder');
+    await expect(
+      loadAndScanWav(new FakeFile('half-frame.wav', bytes) as unknown as File)
+    ).rejects.toMatchObject({ code: 'CORRUPT' });
+    expect(decodeCallCount).toBe(0);
+  });
+
+  it('RIFF 声明区域外附带 fmt 区块 → CORRUPT，不调用解码器', async () => {
+    const bytes = buildWavBytes({ trailingChunks: [{ id: 'fmt ', size: 16 }] });
+    const { loadAndScanWav } = await import('../../src/audio/decoder');
+    await expect(
+      loadAndScanWav(new FakeFile('trailing-fmt.wav', bytes) as unknown as File)
+    ).rejects.toMatchObject({ code: 'CORRUPT' });
+    expect(decodeCallCount).toBe(0);
   });
 
   it('本地文件读取失败 → CORRUPT', async () => {

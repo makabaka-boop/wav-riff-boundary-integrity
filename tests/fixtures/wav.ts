@@ -21,6 +21,10 @@ export interface WavBuildOptions {
   /** 实际 PCM 帧采样值（交错），不足填 0；用于产出真实可解码的音频 */
   pcm?: ArrayLike<number>;
   extraChunks?: Array<{ id: string; size: number; odd?: boolean }>;
+  /** data 区块尾部多写的字节数（计入 data 尺寸与 RIFF 尺寸），制造不足一帧的残缺尾样本 */
+  dataTailBytes?: number;
+  /** 追加在 RIFF 声明区域之外的区块（不计入 riffSize），模拟区域外附带数据 */
+  trailingChunks?: Array<{ id: string; size: number }>;
 }
 
 export function buildWavBytes(opts: WavBuildOptions = {}): ArrayBuffer {
@@ -30,7 +34,7 @@ export function buildWavBytes(opts: WavBuildOptions = {}): ArrayBuffer {
   const frameCount = opts.frameCount ?? 4;
   const blockAlign = channels * Math.ceil(bits / 8);
   const byteRate = sampleRate * blockAlign;
-  const dataBytes = frameCount * blockAlign;
+  const dataBytes = frameCount * blockAlign + (opts.dataTailBytes ?? 0);
 
   const extra = opts.extraChunks ?? [];
   const extraBytes = extra.reduce(
@@ -39,7 +43,10 @@ export function buildWavBytes(opts: WavBuildOptions = {}): ArrayBuffer {
   );
   const riffSize = 36 + dataBytes + extraBytes;
   const total = 8 + riffSize;
-  const buf = new ArrayBuffer(total);
+  // 区域外附带数据：物理上写在文件尾，但不计入 RIFF 声明尺寸
+  const trailing = opts.trailingChunks ?? [];
+  const trailingBytes = trailing.reduce((n, c) => n + 8 + c.size, 0);
+  const buf = new ArrayBuffer(total + trailingBytes);
   const v = new DataView(buf);
   const enc = (s: string, off: number) => {
     for (let i = 0; i < 4; i++) v.setUint8(off + i, s.charCodeAt(i));
@@ -79,6 +86,11 @@ export function buildWavBytes(opts: WavBuildOptions = {}): ArrayBuffer {
     v.setUint32(off + 4, c.size, true);
     off += 8 + c.size;
     if (c.odd) off += 1;
+  }
+  for (const c of trailing) {
+    enc(c.id, off);
+    v.setUint32(off + 4, c.size, true);
+    off += 8 + c.size;
   }
 
   return opts.truncate !== undefined ? buf.slice(0, opts.truncate) : buf;

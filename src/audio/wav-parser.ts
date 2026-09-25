@@ -36,10 +36,17 @@ export function parseWavHeader(bytes: ArrayBuffer): WavHeaderInfo {
     throw new WavError('NOT_WAV', '缺少 RIFF/WAVE 标识，文件不是有效的 WAV 音频');
   }
 
-  // RIFF 声明尺寸超出实际字节 => 被截断
+  // RIFF 声明尺寸必须与实际文件尺寸一致：
+  // 声明更大 => 文件被截断；声明更小 => 声明区域外仍附带数据。
+  // 区域外数据（哪怕是可解析的 fmt/data 区块）不属于有效内容，
+  // 必须稳定判定为损坏，否则是否报错会随浏览器解码行为漂移。
   const riffSize = view.getUint32(4, true);
-  if (riffSize + 8 > bytes.byteLength) {
-    throw new WavError('CORRUPT', `RIFF 声明 ${riffSize + 8} 字节，实际只有 ${bytes.byteLength} 字节，文件已损坏或被截断`);
+  const riffEnd = riffSize + 8;
+  if (riffEnd > bytes.byteLength) {
+    throw new WavError('CORRUPT', `RIFF 声明 ${riffEnd} 字节，实际只有 ${bytes.byteLength} 字节，文件已损坏或被截断`);
+  }
+  if (riffEnd < bytes.byteLength) {
+    throw new WavError('CORRUPT', `RIFF 声明 ${riffEnd} 字节，实际有 ${bytes.byteLength} 字节，声明区域外的数据不属于有效内容，文件已损坏`);
   }
 
   let fmt: {
@@ -52,15 +59,16 @@ export function parseWavHeader(bytes: ArrayBuffer): WavHeaderInfo {
   } | null = null;
   let dataBytes = -1;
 
+  // 只在 RIFF 声明区域内扫描区块：区域外数据一律视为无效内容
   let offset = 12;
-  while (offset + 8 <= bytes.byteLength) {
+  while (offset + 8 <= riffEnd) {
     const chunkId = readAscii(view, offset, 4);
     const chunkSize = view.getUint32(offset + 4, true);
     const bodyStart = offset + 8;
-    if (bodyStart + chunkSize > bytes.byteLength) {
+    if (bodyStart + chunkSize > riffEnd) {
       throw new WavError(
         'CORRUPT',
-        `区块 "${chunkId}" 声明 ${chunkSize} 字节但超出文件末尾，文件已损坏或被截断`
+        `区块 "${chunkId}" 声明 ${chunkSize} 字节但越过 RIFF 声明区域末端，文件已损坏或被截断`
       );
     }
 
@@ -128,7 +136,16 @@ export function parseWavHeader(bytes: ArrayBuffer): WavHeaderInfo {
     throw new WavError('NO_TRACK', 'WAV 文件不含 data 区块，没有可读取的音轨');
   }
 
-  const frameCount = Math.floor(dataBytes / fmt.blockAlign);
+  // 数据尾部不足一个完整采样帧：不能向下取整后当作有效帧数继续扫描，
+  // 残缺尾样本属于结构损坏，必须明确拒绝
+  if (dataBytes % fmt.blockAlign !== 0) {
+    throw new WavError(
+      'CORRUPT',
+      `data 区块长度 ${dataBytes} 字节不是完整采样帧（每帧 ${fmt.blockAlign} 字节）的整数倍，文件已损坏`
+    );
+  }
+
+  const frameCount = dataBytes / fmt.blockAlign;
   if (frameCount === 0) {
     throw new WavError('NO_TRACK', 'data 区块中没有任何完整音频帧，文件不含可读取的音轨');
   }
